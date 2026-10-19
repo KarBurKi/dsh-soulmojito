@@ -1,0 +1,44 @@
+# 提案 0013：卡片 Agent 工作台 — dsh-soulmojito 功能复刻（设计）
+
+> 状态：P1-P3 已实现（P1:1710cb3，P2:1011f10）。日期：2026-10-07。参照物：`flizzywine/dsh-soulmojito`（AGPL-3.0）
+> 公开功能文档（README「对话式修改人物卡」「自助调试 Agent」、feature-inventory H01–H09）。
+> clean-room：只依据行为规格，实施时禁止阅读其源码。
+
+## 1. 目标行为（从公开文档归纳）
+
+- 通过**对话**修改人物卡 / 世界书 / 预设 / 剧本：描述不喜欢什么、想怎么改、保留什么；
+  Agent 读资源 → 给方案 → **确认后写入**工作版。
+- 从小说 / 剧本 / 素材**提取人物**制作新卡；也可从想法空白开始做卡。
+- **游玩排错**：把实际游玩记录与日志交给 Agent，分析正则/美化/正文问题并修改资源。
+- **原版 / 工作版分离**：导入保留原版，日常编辑工作版，可恢复原版。
+
+## 2. 本仓库落点
+
+本仓库已有决定性优势：`tavern-format`（卡/世界书/预设读写）+ `tavern-store`（原子写）+
+`dsh-agent-presets`（preset 组合）。工作台 = **一个 agent preset + 资产工具面 + 确认协议**，
+不是新的执行循环：
+
+| 组件 | 决策 |
+|---|---|
+| preset | `card-workbench` preset：工具 + 提示词（讨论→方案→确认→写入），挂到独立工作台会话 |
+| 资产工具 | `card_get/card_put`（工作版）、`world_get/world_put`、`world_list/world_create`（本书库列举 + 新建世界书，2026-10-08 补齐）、`preset_get/preset_put`、`script_get/script_put`（剧本，读 0014；**已裁剪**——读面由 `material_list`/`material_read` 承担、写面不做，见 `decisions/2026-10-09-workbench-script-tools-cut.md`）、`card_restore_original`（恢复原版）、`chat_log_read`（排错用，读真实游玩记录）。2026-10-08 完整扩展：世界书条目白名单放开到全量实用 ST LoreEntry 字段（声明式字段表驱动 schema/校验/写入/摘要）+ `remove` 删条目 + `uids` 全文读取；新增 `world_delete`（有卡链接先拒、清 activeWorlds）、`world_rename`（卡链接与 activeWorlds 随改）、`world_bind`（书↔卡挂载/解绑）、`world_copy`（整书无损分叉），见 `decisions/2026-10-08-worldbook-full-editing.md`。角色卡侧同构补全：字段白名单扩到 mesExample/systemPrompt/postHistoryInstructions/creator/characterVersion + tags/alternateGreetings 整组数组替换（方案协议值放宽 string\|string[]）、`card_get full` 全文读取、`card_create` 出厂快照、`card_delete` 双重闸门（有聊天先拒、`deleteChats` 二次确认；连带群组/绑定/原版快照清理），见 `decisions/2026-10-08-card-full-editing.md`。2026-10-11 补文件工具行：web 面把 agent 工具行下放给 preset（standard 挂 `@deepseek-ai/dsh-tool-fs`，工作台没挂），对话框附件（原生存储句柄 + dsh-rider 暂存清单行）都指引「用 file tools 读取」而工作台无此工具——preset 声明 plugins 追加宿主默认 tool-fs 行（当日先落地自研受限只读 reference_read，复盘后按「回归 DSH 默认姿势」回滚替换），见 `decisions/2026-10-11-workbench-reference-read.md` |
+| 确认协议 | 写入工具必须携带 `planId`；方案先经 `card_plan_propose` 落库，用户在面板或对话确认后 `card_put(planId)` 才生效——对齐 flizzywine「先给方案，确认后写入」。2026-10-08 面板化扩展：`world_plan_propose` 把世界书编辑/建书纳入同款协议（方案存储 kind 判别，`world_put`/`world_create` 接 planId 路径，面板 diff 按条目分组渲染），见 `decisions/2026-10-08-worldbook-plan-protocol.md` |
+| 原版/工作版 | `tavern-store` 卡目录增加 `.original` 快照（导入时写一次）；工作版即现有文件 |
+| 排错入口 | 面板「交给工作台调试」：引用指定聊天 +楼层范围，工作台会话注入对应记录 |
+| 起始任务 | 修改卡 / 改世界书・预设・剧本 / 新建世界书 / 从素材制卡 / 转 MVU（0012 P3）/ 空白开始 |
+| 会话命名 | card_create 成功后把所在工作台会话改名为卡名（2026-10-08 补充）：绑定记 `createdCard`（自绘侧边栏「写卡工作台」分组据此显示，最新出卡胜出），宿主会话标题经 agent 作用域 ctx 探测 `sessionTitle` 服务后 `rename` 固定；两路均 best-effort，失败不阻断出卡，非工作台绑定会话不受影响 |
+
+## 3. 阶段划分
+
+- **P1**：preset + 读写工具 + 原版快照 + 修改卡任务（最高频路径）。
+- **P2**：确认协议面板化（方案 diff 视图）+ 排错入口 + 世界书/预设任务。
+- **P3**：素材制卡 + card-to-mvu（0012 P3）。
+
+## 4. 明确裁剪
+
+- 不做 flizzywine 的内置 Skill 库分发（create-skill/create-writing-skill 等）：DSH 宿主已有原生
+  skill 机制，工作台只产生内容不经营 Skill 商店。
+- `script_get/script_put` 裁剪（2026-10-09 补记）：读面由 `material_list`/`material_read` 承担，
+  写入面不做——剧本存储是整本导入覆盖语义，与工作台的字段级确认协议不匹配。见
+  `decisions/2026-10-09-workbench-script-tools-cut.md`。
+- 文生图、用户画像不在本提案（画像见独立调研结论，暂缓）。

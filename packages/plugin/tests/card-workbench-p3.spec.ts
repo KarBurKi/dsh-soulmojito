@@ -1,0 +1,538 @@
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { apply as applyPlugin } from '../src/index.js'
+import { apply, type AgentContextLike } from '../src/card-workbench/agent.js'
+import { statusTemplateOf } from '../src/mvu.js'
+import {
+  TavernStore,
+  applyScriptBinding,
+  importScript,
+  readOriginalSnapshot,
+} from '../../tavern-store/src/index.js'
+
+const LEGACY = 'Legacy Card'
+const PLAIN = 'Plain Card'
+const EMPTY_SEED = 'Empty Seed Card'
+const BOUND_SCRIPT = 'Bound Script'
+const SOURCE_NOVEL = 'Source Novel'
+
+interface RegisteredTool {
+  name: string
+  parameters: { properties: Record<string, unknown>; required?: string[] }
+  execute(args: Record<string, unknown>, exec?: { signal?: AbortSignal; agent?: WorkbenchTestAgent }): Promise<any>
+}
+
+/** 测试侧工具执行身份面：对齐 agent.ts 的 WorkbenchExecAgent 鸭子形状。 */
+interface WorkbenchTestAgent {
+  id?: string
+  session?: unknown
+  ctx?: { get?: (name: string) => unknown; sessionTitle?: unknown }
+}
+
+function makeRequest(body: unknown, url: string) {
+  const listeners = new Map<string, (value?: unknown) => void>()
+  return {
+    method: 'POST',
+    url,
+    on: (event: string, listener: (value?: unknown) => void) => {
+      listeners.set(event, listener)
+      if (event === 'end') {
+        listeners.get('data')?.(Buffer.from(JSON.stringify(body)))
+        listener()
+      }
+      return undefined
+    },
+    destroy: () => {},
+  }
+}
+
+function makeResponse() {
+  const chunks: string[] = []
+  const response = {
+    chunks,
+    statusCode: 0,
+    writableEnded: false,
+    setHeader: () => {},
+    write: (chunk: string) => { chunks.push(chunk); return true },
+    end: (chunk?: string) => {
+      if (chunk) chunks.push(chunk)
+      response.writableEnded = true
+    },
+    on: () => {},
+  }
+  return response
+}
+
+function cardPayload(name: string, extensions: Record<string, unknown> = {}) {
+  return {
+    spec: 'chara_card_v2',
+    spec_version: '2.0',
+    data: {
+      name,
+      description: `${name} description with a status bar block.`,
+      personality: 'Calm.',
+      scenario: 'A conversion room.',
+      first_mes: 'Hello.\n<status>favor: 0</status>',
+      mes_example: '', creator_notes: '', system_prompt: '', post_history_instructions: '',
+      alternate_greetings: [], tags: [], creator: '', character_version: '',
+      extensions,
+    },
+  }
+}
+
+/** 每段 ~400 字符 × count 段：按 1200 目标聚合成多个 ~2000 内的块。 */
+function longContent(paragraphCount: number): string {
+  const paragraphs: string[] = []
+  for (let i = 0; i < paragraphCount; i++) {
+    paragraphs.push(`Paragraph ${i}: ${'word '.repeat(79).trim()}.`)
+  }
+  return paragraphs.join('\n\n')
+}
+
+describe('Card Workbench P3: creation, materials, MVU conversion and chat seeding', () => {
+  let home: string
+  let tavern: string
+  let store: TavernStore
+  let apiHandler: (req: unknown, res: unknown) => Promise<void>
+  let tools: Map<string, RegisteredTool>
+  let kernel: string
+
+  beforeAll(async () => {
+    home = mkdtempSync(join(tmpdir(), 'card-workbench-p3-'))
+    process.env.DSH_HOME = home
+    tavern = join(home, 'tavern')
+    store = await TavernStore.open(tavern)
+
+    await applyPlugin({
+      systemPrompt: { section: () => {}, context: () => {} },
+      commands: { register: () => {} },
+      webServer: { register: (def) => { apiHandler = def.handler; return () => {} } },
+      agentPresets: {
+        mount: async () => ({ id: 'agent-tavern' }),
+        recompose: async (_agent: unknown, presetId: string) => ({ id: presetId }),
+        compositionInventory: async () => [{ id: 'agent-tavern' }, { id: 'agent-novel' }, { id: 'card-workbench' }],
+      },
+      tools: { register: () => {} },
+      llm: { stream: async function* () { yield { type: 'finish', reason: { kind: 'stop' } } } },
+      agentDefaultModel: { currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }) },
+      agents: { get: () => undefined },
+      effect: (fn: () => unknown) => { fn(); return () => {} },
+    } as never)
+    expect(apiHandler).toBeDefined()
+
+    tools = new Map()
+    const sections: string[] = []
+    apply({
+      systemPrompt: { section: (section) => { sections.push(typeof section.text === 'string' ? section.text : section.text()) } },
+      tools: { register: (tool) => { tools.set(tool.name, tool as RegisteredTool) } },
+      effect: (factory) => factory(),
+    } satisfies AgentContextLike)
+    kernel = sections.join('\n')
+
+    // store 层直接导入 = 无原版快照（P1 导入钩子未覆盖的老卡），供转换补拍测试。
+    await store.importCharacter(cardPayload(LEGACY))
+    await store.importCharacter(cardPayload(PLAIN))
+    await store.importCharacter(cardPayload(EMPTY_SEED, { agentTavern: { initialVariables: {} } }))
+    await importScript(tavern, BOUND_SCRIPT, 'Chapter one.\n\nChapter two follows.')
+    await importScript(tavern, SOURCE_NOVEL, longContent(12))
+    await applyScriptBinding(store, LEGACY, BOUND_SCRIPT)
+  })
+
+  afterAll(() => {
+    delete process.env.DSH_HOME
+    rmSync(home, { recursive: true, force: true })
+  })
+
+  /* ------------------------------ 注册与内核 ------------------------------ */
+
+  it('registers the P3 tools and kernel starting-task flows', () => {
+    for (const name of ['card_create', 'material_list', 'material_read', 'card_apply_mvu']) {
+      expect(tools.has(name)).toBe(true)
+    }
+    for (const name of ['card_create', 'card_apply_mvu']) {
+      expect(tools.get(name)!.parameters).toMatchObject({ required: expect.arrayContaining(['confirmed']) })
+    }
+    expect(kernel).toContain('Starting tasks')
+    expect(kernel).toContain('card_create')
+    expect(kernel).toContain('material_list')
+    expect(kernel).toContain('material_read')
+    expect(kernel).toContain('card_apply_mvu')
+  })
+
+  /* --------------------------------- 制卡 --------------------------------- */
+
+  it('card_create refuses unconfirmed calls, unknown fields and mismatched names', async () => {
+    const base = { name: 'Refused Card', fields: { description: 'no' } }
+    await expect(tools.get('card_create')!.execute(base)).rejects.toThrow('confirmation required')
+    await expect(tools.get('card_create')!.execute({ ...base, confirmed: false })).rejects.toThrow('confirmation required')
+    await expect(tools.get('card_create')!.execute({ ...base, confirmed: true, fields: { extensions: '{}' } }))
+      .rejects.toThrow('is not settable')
+    await expect(tools.get('card_create')!.execute({ ...base, confirmed: true, fields: { alternateGreetings: 'hi' } }))
+      .rejects.toThrow('alternateGreetings must be an array')
+    await expect(tools.get('card_create')!.execute({ name: 'Refused Card', confirmed: true, fields: { name: 'Other Name' } }))
+      .rejects.toThrow('must match the name argument')
+    await expect(tools.get('card_create')!.execute({ name: '   ', confirmed: true })).rejects.toThrow('must not be blank')
+    expect(await store.getCharacter('Refused Card')).toBeUndefined()
+  })
+
+  it('card_create refuses duplicate names and never overwrites', async () => {
+    await expect(tools.get('card_create')!.execute({ name: LEGACY, confirmed: true }))
+      .rejects.toThrow(`character '${LEGACY}' already exists`)
+    expect((await store.getCharacter(LEGACY))!.card.data.description).toContain('status bar block')
+  })
+
+  it('card_create builds blank and populated cards, round-tripping alternateGreetings', async () => {
+    const blank = await tools.get('card_create')!.execute({ name: 'Blank Slate', confirmed: true })
+    expect(blank).toMatchObject({
+      created: true,
+      character: 'Blank Slate',
+      alternateGreetings: 0,
+      snapshotTaken: true,
+      fieldLengths: { description: 0, personality: 0, scenario: 0, firstMes: 0, creatorNotes: 0 },
+    })
+    expect(JSON.parse(JSON.stringify(blank))).toEqual(blank)
+    // 出厂快照可恢复:restore 回到创建态（快照在 <home>/tavern 下,不在 home 根）
+    expect((await readOriginalSnapshot(join(home, 'tavern'), 'Blank Slate'))?.data.name).toBe('Blank Slate')
+
+    const populated = await tools.get('card_create')!.execute({
+      name: 'Script Hero',
+      confirmed: true,
+      fields: {
+        description: 'Distilled from the novel.',
+        personality: 'Brave.',
+        scenario: 'A harbour town.',
+        firstMes: 'The ship arrives at dawn.',
+        creatorNotes: 'Extracted via material_read.',
+        nickname: 'Hero',
+        alternateGreetings: ['Evening variant.', 'Storm variant.'],
+        mesExample: 'User: who rules here?\nHero: the harbour council.',
+        systemPrompt: 'Narrate in third person.',
+        tags: ['  fantasy ', '', 'harbour'],
+        creator: 'Workbench',
+        characterVersion: '2.0',
+      },
+    })
+    expect(populated).toMatchObject({
+      created: true,
+      character: 'Script Hero',
+      alternateGreetings: 2,
+      snapshotTaken: true,
+      fieldLengths: { description: 'Distilled from the novel.'.length },
+    })
+    const saved = (await store.getCharacter('Script Hero'))!.card
+    expect(saved.data.description).toBe('Distilled from the novel.')
+    expect(saved.data.personality).toBe('Brave.')
+    expect(saved.data.nickname).toBe('Hero')
+    expect(saved.data.alternateGreetings).toEqual(['Evening variant.', 'Storm variant.'])
+    expect(saved.data.mesExample).toBe('User: who rules here?\nHero: the harbour council.')
+    expect(saved.data.systemPrompt).toBe('Narrate in third person.')
+    expect(saved.data.tags).toEqual(['fantasy', 'harbour'])
+    expect(saved.data.creator).toBe('Workbench')
+    expect(saved.data.characterVersion).toBe('2.0')
+    // 创建不绑定任何剧本/世界书：extensions 干净。
+    expect(saved.data.extensions).toEqual({})
+  })
+
+  /* --------------------- 出卡后会话改名为卡名（补充） --------------------- */
+
+  it('card_create renames the hosting workbench session to the card name', async () => {
+    const renames: Array<{ session: unknown; title: string }> = []
+    const liveSession = { id: 'wb-renamed' }
+    await store.updateState((state) => ({
+      sessionBindings: {
+        ...state.sessionBindings,
+        'wb-renamed': {
+          architecture: 'card-workbench', character: '', chatId: '',
+          sourceCharacter: '', sourceChatId: '', createdCard: '',
+        },
+      },
+    }))
+    const result = await tools.get('card_create')!.execute(
+      { name: 'Renamed Hero', confirmed: true },
+      {
+        agent: {
+          id: 'wb-renamed',
+          session: liveSession,
+          ctx: { get: (name: string) => name === 'sessionTitle' ? { rename: (session: unknown, title: string) => { renames.push({ session, title }) } } : undefined },
+        },
+      },
+    )
+    expect(result).toMatchObject({ created: true, character: 'Renamed Hero' })
+    // 绑定面记卡名（侧边栏分组数据源），宿主面以活会话 + 卡名 rename。
+    expect((await store.getState()).sessionBindings['wb-renamed']).toMatchObject({
+      architecture: 'card-workbench',
+      createdCard: 'Renamed Hero',
+    })
+    expect(renames).toEqual([{ session: liveSession, title: 'Renamed Hero' }])
+
+    // 同会话再出一张卡：卡名最新胜出，rename 再发一次。
+    await tools.get('card_create')!.execute(
+      { name: 'Newer Hero', confirmed: true },
+      {
+        agent: {
+          id: 'wb-renamed',
+          session: liveSession,
+          ctx: { get: (name: string) => name === 'sessionTitle' ? { rename: (session: unknown, title: string) => { renames.push({ session, title }) } } : undefined },
+        },
+      },
+    )
+    expect((await store.getState()).sessionBindings['wb-renamed']).toMatchObject({ createdCard: 'Newer Hero' })
+    expect(renames).toHaveLength(2)
+  })
+
+  it('card_create leaves a user-renamed workbench session title untouched', async () => {
+    // 用户在侧边栏显式改过名（binding.title）压过出卡自动改名：createdCard
+    // 照记（数据面），宿主标题不再被卡名覆盖（显式意图最新者胜）。
+    const renames: Array<{ session: unknown; title: string }> = []
+    const liveSession = { id: 'wb-user-title' }
+    await store.updateState((state) => ({
+      sessionBindings: {
+        ...state.sessionBindings,
+        'wb-user-title': {
+          architecture: 'card-workbench', character: '', chatId: '',
+          sourceCharacter: '', sourceChatId: '', createdCard: '', title: 'My draft corner',
+        },
+      },
+    }))
+    const result = await tools.get('card_create')!.execute(
+      { name: 'Titled Hero', confirmed: true },
+      {
+        agent: {
+          id: 'wb-user-title',
+          session: liveSession,
+          ctx: { get: (name: string) => name === 'sessionTitle' ? { rename: (session: unknown, title: string) => { renames.push({ session, title }) } } : undefined },
+        },
+      },
+    )
+    expect(result).toMatchObject({ created: true })
+    expect((await store.getState()).sessionBindings['wb-user-title']).toMatchObject({
+      createdCard: 'Titled Hero',
+      title: 'My draft corner',
+    })
+    expect(renames).toEqual([])
+  })
+
+  it('card_create never fails on missing host faces and leaves foreign sessions untouched', async () => {
+    // 自足绑定，不依赖上一条用例的写入顺序。
+    await store.updateState((state) => ({
+      sessionBindings: {
+        ...state.sessionBindings,
+        'wb-renamed': {
+          architecture: 'card-workbench', character: '', chatId: '',
+          sourceCharacter: '', sourceChatId: '', createdCard: '',
+        },
+      },
+    }))
+    // 无 agent 身份（老宿主/纯工具测试）：照常出卡。
+    const noAgent = await tools.get('card_create')!.execute({ name: 'No Agent Card', confirmed: true })
+    expect(noAgent).toMatchObject({ created: true })
+    // agent 存在但会话未绑定 card-workbench：不写绑定、不 rename。
+    const stray = await tools.get('card_create')!.execute(
+      { name: 'Stray Session Card', confirmed: true },
+      { agent: { id: 'stray-session', session: {}, ctx: { get: () => undefined } } },
+    )
+    expect(stray).toMatchObject({ created: true })
+    // 绑定会话但宿主没有 sessionTitle 服务：绑定面照写卡名，rename 静默跳过。
+    const noService = await tools.get('card_create')!.execute(
+      { name: 'No Service Card', confirmed: true },
+      { agent: { id: 'wb-renamed', session: {} } },
+    )
+    expect(noService).toMatchObject({ created: true })
+    expect((await store.getState()).sessionBindings['wb-renamed']).toMatchObject({ createdCard: 'No Service Card' })
+    // 宿主 rename 抛错（会话不活/标题被拒）不得让出卡失败。
+    const hostile = await tools.get('card_create')!.execute(
+      { name: 'Hostile Rename Card', confirmed: true },
+      { agent: { id: 'wb-renamed', session: {}, ctx: { get: () => ({ rename: () => { throw new Error('session not live') } }) } } },
+    )
+    expect(hostile).toMatchObject({ created: true })
+    expect((await store.getState()).sessionBindings['wb-renamed']).toMatchObject({ createdCard: 'Hostile Rename Card' })
+    // 无关会话从未被写进绑定。
+    expect((await store.getState()).sessionBindings['stray-session']).toBeUndefined()
+  })
+
+  /* -------------------------------- 素材 -------------------------------- */
+
+  it('material_list lists the library with formats, chunk counts and bindings', async () => {
+    const result = await tools.get('material_list')!.execute({})
+    expect(result.count).toBe(2)
+    const bound = result.scripts.find((script: { name: string }) => script.name === BOUND_SCRIPT)
+    const novel = result.scripts.find((script: { name: string }) => script.name === SOURCE_NOVEL)
+    expect(bound).toMatchObject({ format: 'txt', chunkCount: 1, boundCards: [LEGACY] })
+    expect(novel).toMatchObject({ format: 'txt', boundCards: [] })
+    expect(novel.chunkCount).toBeGreaterThan(1)
+  })
+
+  it('material_read reads one chunk with index and budget clamping', async () => {
+    const first = await tools.get('material_read')!.execute({ scriptName: SOURCE_NOVEL })
+    expect(first).toMatchObject({ found: true, script: SOURCE_NOVEL, chunkIndex: 0, truncated: false })
+    expect(first.totalChunks).toBeGreaterThan(1)
+    expect(first.text.length).toBeLessThanOrEqual(2400)
+    expect(first.text).toBe(first.text.slice(0, 2400))
+
+    // maxChars 越界钳制：<1 不合理值钳到 1；>8000 钳到 8000（块本就 ≤2000，取回全文）。
+    const tiny = await tools.get('material_read')!.execute({ scriptName: SOURCE_NOVEL, maxChars: 0 })
+    expect(tiny.truncated).toBe(true)
+    expect(tiny.text.length).toBe(1)
+    const huge = await tools.get('material_read')!.execute({ scriptName: SOURCE_NOVEL, maxChars: 99999 })
+    expect(huge.truncated).toBe(false)
+    expect(huge.text.length).toBe(huge.length)
+
+    // chunkIndex 越界钳制到最后一块，并回报请求值。
+    const clamped = await tools.get('material_read')!.execute({ scriptName: SOURCE_NOVEL, chunkIndex: 999 })
+    expect(clamped.chunkIndex).toBe(clamped.totalChunks - 1)
+    expect(clamped.requestedChunkIndex).toBe(999)
+    const negative = await tools.get('material_read')!.execute({ scriptName: SOURCE_NOVEL, chunkIndex: -7 })
+    expect(negative.chunkIndex).toBe(0)
+
+    // 未知剧本 found:false，不抛错。
+    expect(await tools.get('material_read')!.execute({ scriptName: 'No Such Script' }))
+      .toMatchObject({ found: false, script: 'No Such Script' })
+  })
+
+  /* ------------------------------ 转 MVU ------------------------------ */
+
+  it('card_apply_mvu requires confirmation and validates template and variables', async () => {
+    const base = { character: LEGACY, statusTemplate: '<%= it.day %>' }
+    await expect(tools.get('card_apply_mvu')!.execute({ ...base, initialVariables: { day: 1 } }))
+      .rejects.toThrow('confirmation required')
+    await expect(tools.get('card_apply_mvu')!.execute({ ...base, initialVariables: { day: 1 }, confirmed: false }))
+      .rejects.toThrow('confirmation required')
+    await expect(tools.get('card_apply_mvu')!.execute({ ...base, confirmed: true, statusTemplate: '   ' }))
+      .rejects.toThrow('non-empty string')
+    await expect(tools.get('card_apply_mvu')!.execute({ ...base, confirmed: true, statusTemplate: 'x'.repeat(16001) }))
+      .rejects.toThrow('16000-character limit')
+    await expect(tools.get('card_apply_mvu')!.execute({ ...base, confirmed: true, initialVariables: [] }))
+      .rejects.toThrow('plain object')
+    await expect(tools.get('card_apply_mvu')!.execute({ ...base, confirmed: true, initialVariables: 'nope' }))
+      .rejects.toThrow('plain object')
+    await expect(tools.get('card_apply_mvu')!.execute({
+      ...base, confirmed: true, initialVariables: { blob: 'b'.repeat(64 * 1024 + 1) },
+    })).rejects.toThrow('64KB serialized limit')
+    // 校验失败不落任何东西：卡上还没有 statusTemplate。
+    expect(statusTemplateOf((await store.getCharacter(LEGACY))!.card)).toBeUndefined()
+  })
+
+  it('card_apply_mvu snapshots the pre-conversion card once and preserves agentTavern keys', async () => {
+    expect(await readOriginalSnapshot(tavern, LEGACY)).toBeUndefined()
+    const template = 'Day <%= getvar("day") %> — favor <%= getvar("mvu.favor") %>'
+    const first = await tools.get('card_apply_mvu')!.execute({
+      character: LEGACY,
+      statusTemplate: template,
+      initialVariables: { day: 1, mvu: { favor: 0 } },
+      confirmed: true,
+    })
+    expect(first).toMatchObject({
+      character: LEGACY,
+      statusTemplateLength: template.length,
+      variableKeys: ['day', 'mvu'],
+      snapshotTaken: true,
+      retainedAgentTavernKeys: ['scriptId'],
+    })
+
+    const saved = (await store.getCharacter(LEGACY))!.card
+    const agentTavern = saved.data.extensions.agentTavern as Record<string, unknown>
+    expect(agentTavern).toMatchObject({ scriptId: BOUND_SCRIPT, statusTemplate: template })
+    expect(agentTavern.initialVariables).toEqual({ day: 1, mvu: { favor: 0 } })
+    // 产物直接对接 P1 渲染路径（mvu.ts statusTemplateOf）。
+    expect(statusTemplateOf(saved)).toBe(template)
+    // 正文/开场白不动：旧状态栏块留给确认后的 card_put。
+    expect(saved.data.firstMes).toContain('<status>favor: 0</status>')
+
+    // 补拍的快照是转换前状态：有 scriptId、无 statusTemplate。
+    const snapshot = (await readOriginalSnapshot(tavern, LEGACY))!
+    expect((snapshot.data.extensions.agentTavern as Record<string, unknown>).scriptId).toBe(BOUND_SCRIPT)
+    expect((snapshot.data.extensions.agentTavern as Record<string, unknown>).statusTemplate).toBeUndefined()
+
+    // 二次转换：工作版已被改过（personality），快照也不覆盖——首个胜出。
+    await tools.get('card_put')!.execute({
+      character: LEGACY, confirmed: true,
+      changes: [{ field: 'personality', value: 'Drifted before second conversion.' }],
+    })
+    const second = await tools.get('card_apply_mvu')!.execute({
+      character: LEGACY,
+      statusTemplate: 'v2 template',
+      confirmed: true,
+    })
+    expect(second.snapshotTaken).toBe(false)
+    // initialVariables 省略 → 保留既有；scriptId 仍保留。
+    expect(second.variableKeys).toEqual(['day', 'mvu'])
+    expect(second.retainedAgentTavernKeys).toEqual(['scriptId'])
+    const snapshotAfter = (await readOriginalSnapshot(tavern, LEGACY))!
+    expect((snapshotAfter.data.extensions.agentTavern as Record<string, unknown>).statusTemplate).toBeUndefined()
+    expect(snapshotAfter.data.personality).toBe('Calm.')
+  })
+
+  /* --------------------------- 新聊天变量种子 --------------------------- */
+
+  it('seeds new chats with a deep copy of initialVariables', async () => {
+    const response = makeResponse()
+    await apiHandler(makeRequest({ character: LEGACY }, '/api/dsh-soulmojito/chats'), response)
+    expect(response.statusCode).toBe(200)
+    const body = JSON.parse(response.chunks[0]!)
+    expect(body.ok).toBe(true)
+    expect(body.chat.header.chat_metadata.variables).toEqual({ day: 1, mvu: { favor: 0 } })
+
+    // 深拷贝隔离：改聊天变量（含嵌套）不回写卡上的 initialVariables。
+    const chatId = body.id as string
+    const chat = (await store.getChatSnapshot(LEGACY, chatId))!.chat
+    const variables = chat.header.chat_metadata.variables as Record<string, unknown>
+    ;(variables.mvu as Record<string, unknown>).favor = 99
+    variables.extra = 'chat-only'
+    await store.saveChat(LEGACY, chatId, chat)
+    const cardAgain = (await store.getCharacter(LEGACY))!.card
+    expect((cardAgain.data.extensions.agentTavern as Record<string, unknown>).initialVariables)
+      .toEqual({ day: 1, mvu: { favor: 0 } })
+    expect(statusTemplateOf(cardAgain)).toBe('v2 template')
+  })
+
+  it('writes no variables key for cards without (or with empty) initialVariables', async () => {
+    for (const character of [PLAIN, EMPTY_SEED]) {
+      const response = makeResponse()
+      await apiHandler(makeRequest({ character }, '/api/dsh-soulmojito/chats'), response)
+      expect(response.statusCode).toBe(200)
+      const body = JSON.parse(response.chunks[0]!)
+      expect(body.ok).toBe(true)
+      expect(body.chat.header.chat_metadata.variables).toBeUndefined()
+      expect('variables' in body.chat.header.chat_metadata).toBe(false)
+    }
+  })
+
+  /* --------------------- 写卡会话改名路由（能力补齐） --------------------- */
+
+  it('card-workbench/rename renames a bound workbench session and rejects everything else', async () => {
+    await store.updateState((state) => ({
+      sessionBindings: {
+        ...state.sessionBindings,
+        'wb-api': {
+          architecture: 'card-workbench', character: '', chatId: '',
+          sourceCharacter: '', sourceChatId: '', createdCard: '',
+        },
+        'st-api': { architecture: 'st', character: LEGACY, chatId: 'chat.jsonl' },
+      },
+    }))
+    const response = makeResponse()
+    await apiHandler(makeRequest({ sessionId: 'wb-api', title: '  Draft v2  ' }, '/api/dsh-soulmojito/card-workbench/rename'), response)
+    expect(response.statusCode).toBe(200)
+    const body = JSON.parse(response.chunks[0]!)
+    expect(body.ok).toBe(true)
+    // title 落绑定（侧边栏标签数据源），首尾空白收掉。
+    expect((await store.getState()).sessionBindings['wb-api']).toMatchObject({ title: 'Draft v2' })
+
+    // 非 workbench 绑定 / 未知会话 fail-closed，缺字段与空 title 同样拒绝。
+    for (const [payload, status] of [
+      [{ sessionId: 'st-api', title: 'X' }, 404],
+      [{ sessionId: 'ghost-api', title: 'X' }, 404],
+      [{ sessionId: 'wb-api' }, 400],
+      [{ sessionId: 'wb-api', title: '   ' }, 400],
+    ] as Array<[Record<string, unknown>, number]>) {
+      const rejected = makeResponse()
+      await apiHandler(makeRequest(payload, '/api/dsh-soulmojito/card-workbench/rename'), rejected)
+      expect(rejected.statusCode).toBe(status)
+      expect(JSON.parse(rejected.chunks[0]!).ok).toBe(false)
+    }
+    // 失败路径不留半写状态：wb-api 的 title 未被后续失败请求改动。
+    expect((await store.getState()).sessionBindings['wb-api']).toMatchObject({ title: 'Draft v2' })
+  })
+})

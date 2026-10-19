@@ -1,0 +1,428 @@
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import { apply } from '../src/index.js'
+import { apply as applyAgentTavern, type AgentContextLike } from '../src/agent-tavern/agent.js'
+import {
+  AGENT_PRESET_BLOCK_HEADER,
+  effectiveAgentPresetPrompts,
+  renderAgentPresetBlock,
+} from '../src/agent-tavern/preset.js'
+import { decodeCharacterCard, parsePreset, type PresetIR } from '../../tavern-format/src/index.js'
+import { TavernStore } from '../../tavern-store/src/index.js'
+
+const CHARACTER = 'Preset Character'
+const AGENT = 'preset-agent'
+/** apply() 之后才落库的绑定：用于验证懒装载回退路径（预热只覆盖启动时既有绑定）。 */
+const LATE_AGENT = 'late-bound-agent'
+
+const PRESET_A = {
+  temperature: 0.35,
+  openai_max_context: 8192,
+  openai_max_tokens: 500,
+  prompts: [
+    { name: 'Main Prompt', identifier: 'main', role: 'system', content: 'Follow the preset main rule with {{char}} and {{user}}.', system_prompt: true },
+    { name: 'Style Guide', identifier: 'styleGuide', role: 'system', content: 'Use terse prose.', system_prompt: true },
+    { name: 'Disabled By Slot', identifier: 'slotOff', role: 'system', content: 'SHOULD NOT APPEAR (slot disabled).', system_prompt: true },
+    { name: 'Prompt Field False', identifier: 'promptOff', role: 'system', content: 'PROMPT-FIELD FALSE STILL INJECTS.', system_prompt: true, enabled: false },
+    { name: 'Panel Toggle False', identifier: 'panelOff', role: 'system', content: 'PANEL TOGGLE FALSE STILL INJECTS.', system_prompt: false },
+    { name: 'Empty Entry', identifier: 'emptyOne', role: 'system', content: '   ', system_prompt: true },
+    { name: 'Character Description', identifier: 'charDescription', marker: true, system_prompt: true },
+  ],
+  prompt_order: [{
+    character_id: 100001,
+    order: [
+      { identifier: 'main', enabled: true },
+      { identifier: 'styleGuide', enabled: true },
+      { identifier: 'slotOff', enabled: false },
+      { identifier: 'promptOff', enabled: true },
+      { identifier: 'panelOff', enabled: true },
+      { identifier: 'emptyOne', enabled: true },
+      { identifier: 'charDescription', enabled: true },
+    ],
+  }],
+}
+
+const PRESET_B = {
+  temperature: 1.25,
+  prompts: [
+    { name: 'Main Prompt', identifier: 'main', role: 'system', content: 'PRESET B ONLY TEXT for {{char}}.', system_prompt: true },
+  ],
+  prompt_order: [{ character_id: 100000, order: [{ identifier: 'main', enabled: true }] }],
+}
+
+const CARD = decodeCharacterCard({
+  spec: 'chara_card_v2',
+  spec_version: '2.0',
+  data: {
+    name: CHARACTER,
+    description: 'A preset-test character.',
+    personality: '', scenario: '', first_mes: 'Hello', mes_example: '',
+    creator_notes: '', system_prompt: 'You are {{char}}. {{original}}', post_history_instructions: 'Stay in character.',
+    alternate_greetings: [], tags: [], creator: '', character_version: '', extensions: {},
+  },
+})
+
+function makeAgent(id: string) {
+  return {
+    id,
+    ctx: { id },
+    injections: [] as unknown[],
+    phase: { kind: 'idle', lastTurn: 0 },
+    inject: () => undefined,
+    session: { events: [] as unknown[], append: () => undefined },
+  }
+}
+
+interface MockRequest {
+  method: string
+  url: string
+  destroy: () => void
+  on: (event: string, listener: (value?: unknown) => void) => undefined
+}
+
+function makeRequest(body: unknown, url: string, method = 'POST'): MockRequest {
+  const listeners = new Map<string, (value?: unknown) => void>()
+  return {
+    method,
+    url,
+    on: (event: string, listener: (value?: unknown) => void) => {
+      listeners.set(event, listener)
+      if (event === 'end') {
+        listeners.get('data')?.(Buffer.from(JSON.stringify(body)))
+        listener()
+      }
+      return undefined
+    },
+    destroy: () => {},
+  }
+}
+
+function makeResponse() {
+  const chunks: string[] = []
+  const response = {
+    chunks,
+    statusCode: 0,
+    writableEnded: false,
+    setHeader: () => {},
+    write: (chunk: string) => { chunks.push(chunk); return true },
+    end: (chunk?: string) => {
+      if (chunk) chunks.push(chunk)
+      response.writableEnded = true
+    },
+    on: () => {},
+  }
+  return response
+}
+
+function parseBody(res: { chunks: string[] }): Record<string, any> {
+  return JSON.parse(res.chunks.join('') || '{}') as Record<string, any>
+}
+
+describe('AgentTavern preset projection', () => {
+  let home: string
+  let store: TavernStore
+  let apiHandler: (req: unknown, res: unknown) => Promise<void>
+  let agentSections: Map<string, { name: string; order: number; text: unknown }>
+  let eventListeners: Map<string, (payload: any, next: () => Promise<any>) => Promise<any>>
+  let chatId: string
+
+  const presetTextOf = (agentId: string | undefined): string => {
+    const def = agentSections.get('dsh-soulmojito:agent-preset') as
+      | { text: (assembly?: { agent?: { id?: string } }) => string }
+      | undefined
+    return def!.text(agentId === undefined ? undefined : { agent: { id: agentId } })
+  }
+
+  beforeAll(async () => {
+    home = mkdtempSync(join(tmpdir(), 'dsh-soulmojito-agent-preset-'))
+    process.env.DSH_HOME = home
+    store = await TavernStore.open(join(home, 'tavern'))
+    await store.importCharacter({
+      spec: 'chara_card_v2',
+      spec_version: '2.0',
+      data: {
+        name: CHARACTER, description: 'A preset-test character', personality: '', scenario: '', first_mes: 'Hello',
+        mes_example: '', creator_notes: '', system_prompt: '', post_history_instructions: '',
+        alternate_greetings: [], tags: [], creator: '', character_version: '', extensions: {},
+      },
+    })
+    chatId = await store.createChat(CHARACTER, {
+      user_name: 'User', character_name: CHARACTER,
+      chat_metadata: { createdAt: new Date().toISOString(), timedWorldInfo: {} },
+    }, [])
+    await store.putPreset('Preset A', structuredClone(PRESET_A))
+    await store.putPreset('Preset B', structuredClone(PRESET_B))
+    await store.updateState(() => ({
+      activePreset: 'Preset A',
+      activePersona: 'Rin',
+      sessionBindings: {
+        [AGENT]: { architecture: 'agent-tavern', contextMode: 'dsh-native', character: CHARACTER, chatId },
+      },
+    }))
+
+    let apiHandlerRef: ((req: unknown, res: unknown) => Promise<void>) | undefined
+    const agents = new Map([[AGENT, makeAgent(AGENT)]])
+    apply({
+      systemPrompt: { section: () => {}, context: () => {} },
+      commands: { register: () => {} },
+      webServer: { register: (def: { handler: (req: unknown, res: unknown) => Promise<void> }) => { apiHandlerRef = def.handler; return () => {} } },
+      agentPresets: {
+        mount: async () => ({ id: 'agent-tavern' }),
+        recompose: async (_agent: unknown, presetId: string) => ({ id: presetId }),
+        compositionInventory: async () => [{ id: 'standard' }, { id: 'agent-tavern' }],
+      },
+      tools: { register: () => {} },
+      llm: {
+        stream: async function* () {
+          yield { type: 'text-delta', text: 'reply' }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      },
+      agentDefaultModel: { currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }) },
+      agents: { get: (id: string) => agents.get(id) },
+      effect: (fn: () => unknown) => { fn(); return () => {} },
+    } as never)
+    apiHandler = apiHandlerRef!
+
+    agentSections = new Map()
+    eventListeners = new Map()
+    applyAgentTavern({
+      systemPrompt: {
+        section: (def: { name: string; order: number; text: unknown }) => { agentSections.set(def.name, def) },
+        context: () => {},
+      },
+      tools: { register: () => {} },
+      on: (event: string, listener: (payload: any, next: () => Promise<any>) => Promise<any>) => {
+        eventListeners.set(event, listener)
+        return undefined
+      },
+      effect: (fn: () => unknown) => { fn(); return () => {} },
+    } as unknown as AgentContextLike)
+  })
+
+  afterAll(() => {
+    delete process.env.DSH_HOME
+    rmSync(home, { recursive: true, force: true })
+  })
+
+  it('renders enabled content prompts in prompt_order and skips markers/disabled/empty', () => {
+    const block = renderAgentPresetBlock(parsePreset(structuredClone(PRESET_A)))
+    expect(block).toBeDefined()
+    expect(block!.startsWith(AGENT_PRESET_BLOCK_HEADER)).toBe(true)
+    expect(block).toContain('Follow the preset main rule with {{char}} and {{user}}.')
+    expect(block).toContain('Use terse prose.')
+    // 启用判定只看 prompt_order[].enabled（ST PromptManager.getPromptCollection）：
+    // system_prompt 是分类标记、prompt.enabled 不覆盖 slot——两者为 false 仍注入
+    // （社区预设的写作风格/思考链条目常为 system_prompt:false 且启用，曾因误判整组丢失）。
+    expect(block).toContain('PANEL TOGGLE FALSE STILL INJECTS.')
+    expect(block).toContain('PROMPT-FIELD FALSE STILL INJECTS.')
+    // slot.enabled === false 才是禁用
+    expect(block).not.toContain('SHOULD NOT APPEAR')
+    // marker 条目（角色卡描述占位）不进固定 prompt
+    expect(block).not.toContain('Character Description')
+    // 顺序：main 在 styleGuide 之前
+    expect(block!.indexOf('Follow the preset main rule')).toBeLessThan(block!.indexOf('Use terse prose.'))
+    // 只有 marker 的预设不产生注入块
+    const markersOnly: PresetIR = {
+      prompts: [{ name: 'Character Description', identifier: 'charDescription', marker: true, system_prompt: true }],
+      promptOrder: [{ character_id: 100001, order: [{ identifier: 'charDescription', enabled: true }] }],
+      sampler: {},
+    }
+    expect(renderAgentPresetBlock(markersOnly)).toBeUndefined()
+  })
+
+  it('prefers the ST global order set 100001 and falls back to 100000 then the first set', () => {
+    const raw = {
+      prompts: [
+        { name: 'Global', identifier: 'globalOnly', role: 'system', content: 'GLOBAL SET TEXT.', system_prompt: true },
+        { name: 'Legacy', identifier: 'legacyOnly', role: 'system', content: 'LEGACY SET TEXT.', system_prompt: true },
+        { name: 'First', identifier: 'firstOnly', role: 'system', content: 'FIRST SET TEXT.', system_prompt: true },
+      ],
+      prompt_order: [
+        { character_id: 100000, order: [{ identifier: 'legacyOnly', enabled: true }] },
+        { character_id: 100001, order: [{ identifier: 'globalOnly', enabled: true }] },
+        { character_id: 555, order: [{ identifier: 'firstOnly', enabled: true }] },
+      ],
+    }
+    const block = renderAgentPresetBlock(parsePreset(structuredClone(raw)))
+    expect(block).toContain('GLOBAL SET TEXT.')
+    expect(block).not.toContain('LEGACY SET TEXT.')
+    expect(block).not.toContain('FIRST SET TEXT.')
+
+    const legacyOnly = structuredClone(raw)
+    legacyOnly.prompt_order.splice(1, 1)
+    expect(renderAgentPresetBlock(parsePreset(legacyOnly))).toContain('LEGACY SET TEXT.')
+
+    const firstOnly = structuredClone(raw)
+    firstOnly.prompt_order.splice(0, 2)
+    expect(renderAgentPresetBlock(parsePreset(firstOnly))).toContain('FIRST SET TEXT.')
+  })
+
+  it('applies card systemPrompt/postHistoryInstructions overrides with {{original}}', () => {
+    const preset = structuredClone(PRESET_A) as Record<string, any>
+    preset.prompts.push({ name: 'Post-History Instructions', identifier: 'jailbreak', role: 'system', content: 'base jailbreak text', system_prompt: true })
+    preset.prompt_order[0].order.push({ identifier: 'jailbreak', enabled: true })
+    const parsed = parsePreset(preset)
+
+    const withoutCard = effectiveAgentPresetPrompts(parsed)
+    expect(withoutCard.find((prompt) => prompt.identifier === 'main')?.content)
+      .toBe('Follow the preset main rule with {{char}} and {{user}}.')
+
+    const withCard = effectiveAgentPresetPrompts(parsed, CARD)
+    expect(withCard.find((prompt) => prompt.identifier === 'main')?.content)
+      .toBe('You are {{char}}. Follow the preset main rule with {{char}} and {{user}}.')
+    expect(withCard.find((prompt) => prompt.identifier === 'jailbreak')?.content).toBe('Stay in character.')
+  })
+
+  it('registers the -75 preset section and serves the preset block with macros expanded', async () => {
+    expect(agentSections.get('dsh-soulmojito:agent-preset')?.order).toBe(-75)
+    // apply() 启动预热或首次装配的懒装载都会触发装载；waitFor 落定（预热消除
+    // 重启后首轮空串→整块出现的 system 头突变，见 preheatAgentPresetProjections）。
+    await vi.waitFor(() => {
+      expect(presetTextOf(AGENT)).toContain('Follow the preset main rule')
+    })
+    const text = presetTextOf(AGENT)
+    expect(text).toContain('Follow the preset main rule with Preset Character and Rin.')
+    expect(text).toContain('Use terse prose.')
+    expect(text.startsWith(AGENT_PRESET_BLOCK_HEADER)).toBe(true)
+    // 宿主插值守卫：展开 + 中性化后不得残留 {{（见 prompt-safety.ts）
+    expect(text).not.toContain('{{')
+    expect(presetTextOf(undefined)).toBe('')
+    expect(presetTextOf('unbound-agent')).toBe('')
+  })
+
+  it('lazy-loads agents bound after startup: empty until the fallback load lands', async () => {
+    // 预热只覆盖 apply() 时已存在的绑定；之后新绑定的 agent 走懒装载回退路径
+    // ——首次装配返回空串，装载完成后落定（与预热前的旧行为一致）。
+    await store.updateState((state) => ({
+      sessionBindings: {
+        ...state.sessionBindings,
+        [LATE_AGENT]: { architecture: 'agent-tavern', contextMode: 'dsh-native', character: CHARACTER, chatId },
+      },
+    }))
+    expect(presetTextOf(LATE_AGENT)).toBe('')
+    await vi.waitFor(() => {
+      expect(presetTextOf(LATE_AGENT)).toContain('Follow the preset main rule')
+    })
+  })
+
+  it('projects the preset temperature through agent/request and passes unbound agents through', async () => {
+    const listener = eventListeners.get('agent/request')
+    expect(listener).toBeDefined()
+    const base = { provider: 'test-provider', model: 'test-model' }
+    const config = await listener!({ agent: { id: AGENT } }, async () => base)
+    expect(config.temperature).toBe(0.35)
+    // 非 AgentTavern 绑定原样透传（不叠加温度）
+    const untouched = await listener!({ agent: { id: 'unbound-agent' } }, async () => base)
+    expect(untouched).toEqual(base)
+  })
+
+  it('keeps the block byte-stable across write-through reloads (frozen clock and rng)', async () => {
+    // 前缀缓存纪律（决策 2026-10-09-agent-preset-cache-stability）：预设块住在
+    // 宿主受保护 system 头，字节一变其后全部历史/工具消息的缓存一并作废。
+    // 动态宏（{{time}}/{{date}}/{{random}}）按绑定的冻结记录求值——没有真实
+    // 输入变化的写穿重载必须复现同一字节。
+    const STABLE = {
+      temperature: 0.7,
+      prompts: [
+        { name: 'Clock', identifier: 'clock', role: 'system', content: 'Time is {{time}} on {{date}} at {{datetimeformat::HH:mm:ss}}; pick {{random:crimson,azure}} for {{char}}.', system_prompt: true },
+      ],
+      prompt_order: [{ character_id: 100001, order: [{ identifier: 'clock', enabled: true }] }],
+    }
+    const putRes = makeResponse()
+    await apiHandler(makeRequest({ name: 'Preset Stable', data: STABLE }, `/api/dsh-soulmojito/preset/${encodeURIComponent('Preset Stable')}`, 'PUT'), putRes)
+    expect(putRes.statusCode).toBe(200)
+    const switchRes = makeResponse()
+    await apiHandler(makeRequest({ activePreset: 'Preset Stable' }, '/api/dsh-soulmojito/state'), switchRes)
+    expect(switchRes.statusCode).toBe(200)
+    await vi.waitFor(() => {
+      expect(presetTextOf(AGENT)).toContain('Time is')
+    })
+    const first = presetTextOf(AGENT)
+    const token = /Time is (.+?) on (.+?) at (.+?); pick (.+?) for/.exec(first)
+    expect(token).not.toBeNull()
+
+    // 跨过秒边界再无输入变化写穿（同内容 PUT 触发重载；路由内 await emit，返回即
+    // 落定）：若宏未按冻结记录求值，秒级时间戳必然换值——旧实现在此确定性变红。
+    await new Promise((resolve) => setTimeout(resolve, 1200))
+    const rewriteRes = makeResponse()
+    await apiHandler(makeRequest({ name: 'Preset Stable', data: structuredClone(STABLE) }, `/api/dsh-soulmojito/preset/${encodeURIComponent('Preset Stable')}`, 'PUT'), rewriteRes)
+    expect(rewriteRes.statusCode).toBe(200)
+    expect(presetTextOf(AGENT)).toBe(first)
+
+    // 内容编辑仍即时生效（用户主动改预设，一次性重建缓存是可接受代价），
+    // 但冻结宏的取值不漂移——只有编辑的文本变，时钟/随机选择停在装载时刻。
+    const edited = structuredClone(STABLE)
+    edited.prompts[0]!.content = 'Time is {{time}} on {{date}} at {{datetimeformat::HH:mm:ss}}; pick {{random:crimson,azure}} — EDITED for {{char}}.'
+    const editRes = makeResponse()
+    await apiHandler(makeRequest({ name: 'Preset Stable', data: edited }, `/api/dsh-soulmojito/preset/${encodeURIComponent('Preset Stable')}`, 'PUT'), editRes)
+    expect(editRes.statusCode).toBe(200)
+    const second = presetTextOf(AGENT)
+    expect(second).not.toBe(first)
+    expect(second).toContain(`Time is ${token![1]} on ${token![2]} at ${token![3]}; pick ${token![4]} — EDITED for Preset Character.`)
+
+    // 收尾：恢复 Preset A，供后续路由用例的起始状态。
+    const backRes = makeResponse()
+    await apiHandler(makeRequest({ activePreset: 'Preset A' }, '/api/dsh-soulmojito/state'), backRes)
+    expect(backRes.statusCode).toBe(200)
+    await vi.waitFor(() => {
+      expect(presetTextOf(AGENT)).toContain('Follow the preset main rule')
+    })
+  })
+
+  it('refreshes the projection through the state, preset edit and delete routes', async () => {
+    const switchRes = makeResponse()
+    await apiHandler(makeRequest({ activePreset: 'Preset B' }, '/api/dsh-soulmojito/state'), switchRes)
+    expect(switchRes.statusCode).toBe(200)
+    await vi.waitFor(() => {
+      expect(presetTextOf(AGENT)).toContain('PRESET B ONLY TEXT for Preset Character.')
+    })
+    expect(presetTextOf(AGENT)).not.toContain('Follow the preset main rule')
+
+    const listener = eventListeners.get('agent/request')!
+    const config = await listener({ agent: { id: AGENT } }, async () => ({ provider: 'p', model: 'm' }))
+    expect(config.temperature).toBe(1.25)
+
+    const edited = structuredClone(PRESET_B)
+    edited.prompts[0]!.content = 'PRESET B EDITED TEXT for {{char}}.'
+    const editRes = makeResponse()
+    await apiHandler(makeRequest({ name: 'Preset B', data: edited }, `/api/dsh-soulmojito/preset/${encodeURIComponent('Preset B')}`, 'PUT'), editRes)
+    expect(editRes.statusCode).toBe(200)
+    await vi.waitFor(() => {
+      expect(presetTextOf(AGENT)).toContain('PRESET B EDITED TEXT for Preset Character.')
+    })
+
+    const deleteRes = makeResponse()
+    await apiHandler(makeRequest({}, `/api/dsh-soulmojito/preset?name=${encodeURIComponent('Preset B')}`, 'DELETE'), deleteRes)
+    expect(deleteRes.statusCode).toBe(200)
+    // 删除激活预设 → 回落内置默认预设（面板「内置角色扮演预设」的同一份语义）
+    await vi.waitFor(() => {
+      expect(presetTextOf(AGENT)).toContain('fictional roleplay chat between Preset Character and Rin')
+    })
+    expect(presetTextOf(AGENT)).not.toContain('PRESET B')
+    // 内置默认预设的 temperature = 1
+    const fallback = await listener({ agent: { id: AGENT } }, async () => ({ provider: 'p', model: 'm' }))
+    expect(fallback.temperature).toBe(1)
+  })
+
+  it('keeps the invalidation registry shared across module instances (split bundles)', async () => {
+    // 真实部署里 emit 在 index.mjs / card-workbench.mjs、监听在 agent.mjs：模块级
+    // Set 会各持一份，写穿静默失效。globalThis（Symbol.for）锚定必须跨实例共享。
+    vi.resetModules()
+    const first = await import('../src/agent-tavern/preset.js')
+    let fired = 0
+    const dispose = first.onAgentPresetChanged(() => { fired += 1 })
+    try {
+      vi.resetModules()
+      const second = await import('../src/agent-tavern/preset.js')
+      // 前提：确实是两个模块实例（否则本测试不能证明注册表跨实例共享）。
+      expect(second).not.toBe(first)
+      await second.emitAgentPresetChanged()
+      expect(fired).toBe(1)
+    } finally {
+      dispose()
+    }
+  })
+})
